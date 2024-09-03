@@ -38,6 +38,7 @@ from .._grammar import (
     select,
 )
 from ._tokenizer import Tokenizer
+from ..visual import VisualRegistry, ModelUpdateMessage, MODEL_TOPIC, ModelTrackingMessage, Message
 
 if TYPE_CHECKING:
     from ..library._block import ContextBlock
@@ -203,7 +204,7 @@ class Model:
     _grammar_only = 0  # a flag that tracks when we are forced to be executing only compiled grammars (like when we are inside a select)
     _throttle_refresh = 0  # a flag that tracks when we can throttle our display since we know future display calls are going to happen
 
-    def __init__(self, engine, echo=True, **kwargs):
+    def __init__(self, engine, echo:Union[bool,str] = True, parent_model_id: Optional[int] = None, **kwargs):
         """Build a new model object that represents a model in a given state.
 
         Note that this constructor is not meant to be used directly, since there
@@ -212,8 +213,11 @@ class Model:
         ----------
         engine : Engine
             The inference engine to use for this model.
-        echo : bool
+        echo : Union[bool,str]
             If true the final result of creating this model state will be displayed (as HTML in a notebook).
+            Otherwise if "inspect", provides alternative display for debugging.
+        parent_model_id : Optional[int]
+            User does not have to define this, used for model tracking.
         """
         if isinstance(engine, str) and engine.startswith("http"):
             from ._remote import RemoteEngine
@@ -241,6 +245,9 @@ class Model:
         self._event_parent = None
         self._last_display = 0  # used to track the last display call to enable throttling
         self._last_event_stream = 0  # used to track the last event streaming call to enable throttling
+
+        self._parent_model_id = parent_model_id  # required for model tracking
+        self._model_id = VisualRegistry.id_generator().gen()  # required to follow path of models generated
 
     @property
     def active_role_end(self):
@@ -314,6 +321,10 @@ class Model:
         elif self._event_parent is not None:
             # otherwise if the current event que has an event parent then that is also our parent
             new_lm._event_parent = self._event_parent  
+        
+        # reconfigure identifiers
+        new_lm._parent_model_id = self._model_id
+        new_lm._model_id = VisualRegistry.id_generator().gen()
 
         return new_lm
 
@@ -332,6 +343,12 @@ class Model:
         # update the byte state
         self._state += str(value)  # TODO: make _state to be bytes not a string
 
+        logger.info(self._state)
+        self._notify(ModelTrackingMessage(
+            model_id=self._model_id,
+            parent_model_id=self._parent_model_id
+        ))
+
         # see if we should update the display
         if not force_silent:
             self._update_display()
@@ -344,9 +361,17 @@ class Model:
                 self._send_to_event_queue(self)
         else:
             self._send_to_event_queue(self)
+    
+    def _notify(self, msg: Message):
+        if self.echo == "inspect":
+            exchange = VisualRegistry.topic_exchange()
+            exchange.publish(
+                f"{MODEL_TOPIC}{self._model_id}",
+                msg
+            )
 
     def _update_display(self, throttle=True):
-        if self.echo:
+        if self.echo is True:
             if Model._throttle_refresh > 0:
                 curr_time = time.time()
                 if throttle and curr_time - self._last_display < self.max_display_rate:
@@ -388,6 +413,10 @@ class Model:
         out = self._current_prompt()
         for context in reversed(self.opened_blocks):
             out += format_pattern.sub("", self.opened_blocks[context][1])
+        return out
+
+    def __iadd__(self, other):
+        out = self + other
         return out
 
     def __add__(self, value):
@@ -497,8 +526,9 @@ class Model:
                         f"A guidance function did not return a model object! Did you try to add a function to a model without calling the function? For example `model + guidance_function()` is correct, while `model + guidance_function` will cause this error."
                     )
 
+        # TODO(nopdive): Consider dropping this on viz redesign
         # this flushes the display
-        out._inplace_append("")
+        # out._inplace_append("")
 
         return out
 
@@ -712,6 +742,16 @@ class Model:
                     lm += new_text
                     if chunk.is_generated:
                         lm += "<||_html:</span>_||>"
+                    
+                    self._notify(ModelUpdateMessage(
+                        model_id=lm._model_id,
+                        parent_model_id=lm._parent_model_id,
+                        content_type="text",
+                        content=new_text,
+                        prob=chunk.new_bytes_prob,
+                        token_count=chunk.new_token_count,
+                        is_generated=chunk.is_generated * 1
+                    ))
 
                 # last_is_generated = chunk.is_generated
 

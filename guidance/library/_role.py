@@ -54,7 +54,7 @@ def role_closer(lm, role_name, **kwargs):
     # TODO [HN]: Temporary change while I instrument chat_template in transformers only.
     # Eventually have all models use chat_template.
     if hasattr(lm, "get_role_end"):
-        lm += lm.get_role_end(role_name)
+        lm += lm.get_role_end(role_name, **kwargs)
     elif hasattr(lm, "chat_template"):
         lm += lm.chat_template.get_role_end(role_name)
 
